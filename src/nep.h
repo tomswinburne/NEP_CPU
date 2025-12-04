@@ -183,6 +183,18 @@ public:
     double** virial          // cvatom or nullptr
   );
 
+  void compute_descriptors_for_lammps(
+    int nlocal,        // atom->nlocal
+    int inum,          // list->inum
+    int* ilist,        // list->ilist
+    int* numneigh,     // list->numneigh
+    int** firstneigh,  // list->firstneigh
+    int* type,         // atom->type
+    int* type_map,     // map from atom type to element
+    double** x,        // atom->x
+    double** descriptor // output descriptor[nlocal][dim]
+  );
+
   int num_atoms = 0;
   int num_cells[3];
   double ebox[18];

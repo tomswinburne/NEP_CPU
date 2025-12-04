@@ -3369,6 +3369,135 @@ void NEP3::compute_for_lammps(
   }
 }
 
+void NEP3::compute_descriptors_for_lammps(
+  int nlocal,
+  int inum,
+  int* ilist,
+  int* numneigh,
+  int** firstneigh,
+  int* type,
+  int* type_map,
+  double** x,
+  double** descriptor)
+{
+  for (int ii = 0; ii < inum; ++ii) {
+    int n1 = ilist[ii];
+    int t1 = type_map[type[n1]];
+    double q[MAX_DIM] = {0.0};
+
+    // Compute radial descriptors
+    for (int i1 = 0; i1 < numneigh[n1]; ++i1) {
+      int n2 = firstneigh[n1][i1];
+      double r12[3] = {x[n2][0] - x[n1][0], x[n2][1] - x[n1][1], x[n2][2] - x[n1][2]};
+
+      double d12sq = r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2];
+      if (d12sq >= paramb.rc_radial * paramb.rc_radial) {
+        continue;
+      }
+      double d12 = sqrt(d12sq);
+      int t2 = type_map[type[n2]];
+
+#ifdef USE_TABLE_FOR_RADIAL_FUNCTIONS
+      int index_left, index_right;
+      double weight_left, weight_right;
+      find_index_and_weight(
+        d12 * paramb.rcinv_radial, index_left, index_right, weight_left, weight_right);
+      int t12 = t1 * paramb.num_types + t2;
+      for (int n = 0; n <= paramb.n_max_radial; ++n) {
+        q[n] +=
+          gn_radial[(index_left * paramb.num_types_sq + t12) * (paramb.n_max_radial + 1) + n] *
+            weight_left +
+          gn_radial[(index_right * paramb.num_types_sq + t12) * (paramb.n_max_radial + 1) + n] *
+            weight_right;
+      }
+#else
+      double fc12;
+      double rc = paramb.rc_radial;
+      double rcinv = paramb.rcinv_radial;
+      if (paramb.use_typewise_cutoff) {
+        rc = std::min(
+          (COVALENT_RADIUS[paramb.atomic_numbers[t1]] +
+           COVALENT_RADIUS[paramb.atomic_numbers[t2]]) *
+            paramb.typewise_cutoff_radial_factor,
+          rc);
+        rcinv = 1.0 / rc;
+      }
+      find_fc(rc, rcinv, d12, fc12);
+      double fn12[MAX_NUM_N];
+      find_fn(paramb.basis_size_radial, rcinv, d12, fc12, fn12);
+      for (int n = 0; n <= paramb.n_max_radial; ++n) {
+        double gn12 = 0.0;
+        for (int k = 0; k <= paramb.basis_size_radial; ++k) {
+          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
+          c_index += t1 * paramb.num_types + t2;
+          gn12 += fn12[k] * annmb.c[c_index];
+        }
+        q[n] += gn12;
+      }
+#endif
+    }
+
+    // Compute angular descriptors
+    for (int n = 0; n <= paramb.n_max_angular; ++n) {
+      double s[NUM_OF_ABC] = {0.0};
+      for (int i1 = 0; i1 < numneigh[n1]; ++i1) {
+        int n2 = firstneigh[n1][i1];
+        double r12[3] = {x[n2][0] - x[n1][0], x[n2][1] - x[n1][1], x[n2][2] - x[n1][2]};
+
+        double d12sq = r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2];
+        if (d12sq >= paramb.rc_angular * paramb.rc_angular) {
+          continue;
+        }
+        double d12 = sqrt(d12sq);
+        int t2 = type_map[type[n2]];
+
+#ifdef USE_TABLE_FOR_RADIAL_FUNCTIONS
+        int index_left, index_right;
+        double weight_left, weight_right;
+        find_index_and_weight(
+          d12 * paramb.rcinv_angular, index_left, index_right, weight_left, weight_right);
+        int t12 = t1 * paramb.num_types + t2;
+        double gn12 =
+          gn_angular[(index_left * paramb.num_types_sq + t12) * (paramb.n_max_angular + 1) + n] *
+            weight_left +
+          gn_angular[(index_right * paramb.num_types_sq + t12) * (paramb.n_max_angular + 1) + n] *
+            weight_right;
+        accumulate_s(paramb.L_max, d12, r12[0], r12[1], r12[2], gn12, s);
+#else
+        double fc12;
+        double rc = paramb.rc_angular;
+        double rcinv = paramb.rcinv_angular;
+        if (paramb.use_typewise_cutoff) {
+          rc = std::min(
+            (COVALENT_RADIUS[paramb.atomic_numbers[t1]] +
+             COVALENT_RADIUS[paramb.atomic_numbers[t2]]) *
+              paramb.typewise_cutoff_angular_factor,
+            rc);
+          rcinv = 1.0 / rc;
+        }
+        find_fc(rc, rcinv, d12, fc12);
+        double fn12[MAX_NUM_N];
+        find_fn(paramb.basis_size_angular, rcinv, d12, fc12, fn12);
+        double gn12 = 0.0;
+        for (int k = 0; k <= paramb.basis_size_angular; ++k) {
+          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
+          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
+          gn12 += fn12[k] * annmb.c[c_index];
+        }
+        accumulate_s(paramb.L_max, d12, r12[0], r12[1], r12[2], gn12, s);
+#endif
+      }
+      find_q(
+        paramb.L_max, paramb.num_L, paramb.n_max_angular + 1, n, s, q + (paramb.n_max_radial + 1));
+    }
+
+    // Apply scaling and copy to output
+    for (int d = 0; d < annmb.dim; ++d) {
+      descriptor[n1][d] = q[d] * paramb.q_scaler[d];
+    }
+  }
+}
+
 bool NEP3::set_dftd3_para_one(
   const std::string& functional_input,
   const std::string& functional_library,
