@@ -3181,6 +3181,88 @@ void NEP3::find_B_projection(
     Fp.data(), sum_fxyz.data(), nullptr, nullptr, nullptr, nullptr, true, B_projection.data());
 }
 
+void NEP3::find_gradient_parameters(
+  const std::vector<int>& type,
+  const std::vector<double>& box,
+  const std::vector<double>& position,
+  std::vector<double>& gradient_vector)
+{
+  const int N = type.size();
+  const int size_x12 = N * MN;
+  const int num_neurons = annmb.num_neurons1;
+  const int dim = annmb.dim;
+
+  if (N * 3 != position.size()) {
+    std::cout << "Type and position sizes are inconsistent.\n";
+    exit(1);
+  }
+
+  // Total size: num_neurons (for A_l/dE/dv_l) + num_neurons * dim (for B_lj/dE/dw_lj)
+  //           + num_neurons (for C_l/dE/db_l) + 1 (for dE/db_output)
+  const int total_size = num_neurons + num_neurons * dim + num_neurons + 1;
+  if (gradient_vector.size() != total_size) {
+    std::cout << "Gradient vector size is inconsistent. Expected " << total_size
+              << " but got " << gradient_vector.size() << "\n";
+    exit(1);
+  }
+
+  // Initialize gradient vector to zero
+  for (int i = 0; i < total_size; ++i) {
+    gradient_vector[i] = 0.0;
+  }
+
+  // Get B_projection for all atoms
+  std::vector<double> B_projection(N * num_neurons * (dim + 2));
+  allocate_memory(N);
+  find_neighbor_list_small_box(
+    paramb.rc_radial, paramb.rc_angular, N, box, position, num_cells, ebox, NN_radial, NL_radial,
+    NN_angular, NL_angular, r12);
+
+  find_descriptor_small_box(
+    false, false, false, false, paramb, annmb, N, NN_radial.data(), NL_radial.data(),
+    NN_angular.data(), NL_angular.data(), type.data(), r12.data(), r12.data() + size_x12,
+    r12.data() + size_x12 * 2, r12.data() + size_x12 * 3, r12.data() + size_x12 * 4,
+    r12.data() + size_x12 * 5,
+#ifdef USE_TABLE_FOR_RADIAL_FUNCTIONS
+    gn_radial.data(), gn_angular.data(),
+#endif
+    Fp.data(), sum_fxyz.data(), nullptr, nullptr, nullptr, nullptr, true, B_projection.data());
+
+  // Compute gradients from B_projection
+  // B_projection layout per atom per neuron: [n * (dim + 2) + d] where:
+  //   - d = 0 to dim-1: dE/dw0[n,d] = v_l * D_ij * (1-tanh^2)
+  //   - d = dim: dE/db0[n] = -v_l * (1-tanh^2)
+  //   - d = dim+1: dE/dw1[n] = tanh(...)
+  //
+  // Gradient vector layout:
+  //   [0 : num_neurons-1]                          -> A_l = dE/dv_l (output layer weights)
+  //   [num_neurons : num_neurons + num_neurons*dim] -> B_lj = dE/dw_lj (hidden layer weights)
+  //   [num_neurons + num_neurons*dim : 2*num_neurons + num_neurons*dim] -> C_l = dE/db_l (hidden layer biases)
+  //   [2*num_neurons + num_neurons*dim]             -> dE/db_output (output layer bias)
+
+  for (int atom = 0; atom < N; ++atom) {
+    const int atom_offset = atom * num_neurons * (dim + 2);
+
+    for (int l = 0; l < num_neurons; ++l) {
+      const int neuron_offset = atom_offset + l * (dim + 2);
+
+      // A_l = dE/dv_l = sum over atoms of tanh(sum_j w_lj * D_ij - b_l)
+      gradient_vector[l] += B_projection[neuron_offset + dim + 1];
+
+      // B_lj = dE/dw_lj = sum over atoms of v_l * D_ij * (1-tanh^2)
+      for (int j = 0; j < dim; ++j) {
+        gradient_vector[num_neurons + l * dim + j] += B_projection[neuron_offset + j];
+      }
+
+      // C_l = dE/db_l = sum over atoms of -v_l * (1-tanh^2)
+      gradient_vector[num_neurons + num_neurons * dim + l] += B_projection[neuron_offset + dim];
+    }
+
+    // dE/db_output = -1 for each atom (since energy -= b1[0])
+    gradient_vector[num_neurons + num_neurons * dim + num_neurons] -= 1.0;
+  }
+}
+
 void NEP3::find_dipole(
   const std::vector<int>& type,
   const std::vector<double>& box,
@@ -3495,6 +3577,188 @@ void NEP3::compute_descriptors_for_lammps(
     for (int d = 0; d < annmb.dim; ++d) {
       descriptor[n1][d] = q[d] * paramb.q_scaler[d];
     }
+  }
+}
+
+void NEP3::compute_gradient_for_lammps(
+  int nlocal,
+  int inum,
+  int* ilist,
+  int* numneigh,
+  int** firstneigh,
+  int* type,
+  int* type_map,
+  double** x,
+  double* gradient)
+{
+  const int num_neurons = annmb.num_neurons1;
+  const int dim = annmb.dim;
+  const int total_size = num_neurons + num_neurons * dim + num_neurons + 1;
+
+  // Initialize gradient vector to zero
+  for (int i = 0; i < total_size; ++i) {
+    gradient[i] = 0.0;
+  }
+
+  // Temporary arrays for per-atom computation
+  double q[MAX_DIM] = {0.0};
+  double Fp[MAX_DIM] = {0.0};
+  double latent_space[MAX_NEURON];
+  double B_projection[MAX_NEURON * (MAX_DIM + 2)];
+
+  // Loop over atoms and compute descriptors + gradients
+  for (int ii = 0; ii < inum; ++ii) {
+    int n1 = ilist[ii];
+    int t1 = type_map[type[n1]];
+
+    // Reset q array for this atom
+    for (int d = 0; d < dim; ++d) {
+      q[d] = 0.0;
+    }
+
+    // Compute radial descriptors
+    for (int i1 = 0; i1 < numneigh[n1]; ++i1) {
+      int n2 = firstneigh[n1][i1];
+      double r12[3] = {x[n2][0] - x[n1][0], x[n2][1] - x[n1][1], x[n2][2] - x[n1][2]};
+
+      double d12sq = r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2];
+      if (d12sq >= paramb.rc_radial * paramb.rc_radial) {
+        continue;
+      }
+      double d12 = sqrt(d12sq);
+      int t2 = type_map[type[n2]];
+
+#ifdef USE_TABLE_FOR_RADIAL_FUNCTIONS
+      int index_left, index_right;
+      double weight_left, weight_right;
+      find_index_and_weight(
+        d12 * paramb.rcinv_radial, index_left, index_right, weight_left, weight_right);
+      int t12 = t1 * paramb.num_types + t2;
+      for (int n = 0; n <= paramb.n_max_radial; ++n) {
+        q[n] +=
+          gn_radial[(index_left * paramb.num_types_sq + t12) * (paramb.n_max_radial + 1) + n] *
+            weight_left +
+          gn_radial[(index_right * paramb.num_types_sq + t12) * (paramb.n_max_radial + 1) + n] *
+            weight_right;
+      }
+#else
+      double fc12;
+      double rc = paramb.rc_radial;
+      double rcinv = paramb.rcinv_radial;
+      if (paramb.use_typewise_cutoff) {
+        rc = std::min(
+          (COVALENT_RADIUS[paramb.atomic_numbers[t1]] +
+           COVALENT_RADIUS[paramb.atomic_numbers[t2]]) *
+            paramb.typewise_cutoff_radial_factor,
+          rc);
+        rcinv = 1.0 / rc;
+      }
+      find_fc(rc, rcinv, d12, fc12);
+      double fn12[MAX_NUM_N];
+      find_fn(paramb.basis_size_radial, rcinv, d12, fc12, fn12);
+      for (int n = 0; n <= paramb.n_max_radial; ++n) {
+        double gn12 = 0.0;
+        for (int k = 0; k <= paramb.basis_size_radial; ++k) {
+          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
+          c_index += t1 * paramb.num_types + t2;
+          gn12 += fn12[k] * annmb.c[c_index];
+        }
+        q[n] += gn12;
+      }
+#endif
+    }
+
+    // Compute angular descriptors
+    for (int n = 0; n <= paramb.n_max_angular; ++n) {
+      double s[NUM_OF_ABC] = {0.0};
+      for (int i1 = 0; i1 < numneigh[n1]; ++i1) {
+        int n2 = firstneigh[n1][i1];
+        double r12[3] = {x[n2][0] - x[n1][0], x[n2][1] - x[n1][1], x[n2][2] - x[n1][2]};
+
+        double d12sq = r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2];
+        if (d12sq >= paramb.rc_angular * paramb.rc_angular) {
+          continue;
+        }
+        double d12 = sqrt(d12sq);
+        int t2 = type_map[type[n2]];
+
+#ifdef USE_TABLE_FOR_RADIAL_FUNCTIONS
+        int index_left, index_right;
+        double weight_left, weight_right;
+        find_index_and_weight(
+          d12 * paramb.rcinv_angular, index_left, index_right, weight_left, weight_right);
+        int t12 = t1 * paramb.num_types + t2;
+        double gn12 =
+          gn_angular[(index_left * paramb.num_types_sq + t12) * (paramb.n_max_angular + 1) + n] *
+            weight_left +
+          gn_angular[(index_right * paramb.num_types_sq + t12) * (paramb.n_max_angular + 1) + n] *
+            weight_right;
+        accumulate_s(paramb.L_max, d12, r12[0], r12[1], r12[2], gn12, s);
+#else
+        double fc12;
+        double rc = paramb.rc_angular;
+        double rcinv = paramb.rcinv_angular;
+        if (paramb.use_typewise_cutoff) {
+          rc = std::min(
+            (COVALENT_RADIUS[paramb.atomic_numbers[t1]] +
+             COVALENT_RADIUS[paramb.atomic_numbers[t2]]) *
+              paramb.typewise_cutoff_angular_factor,
+            rc);
+          rcinv = 1.0 / rc;
+        }
+        find_fc(rc, rcinv, d12, fc12);
+        double fn12[MAX_NUM_N];
+        find_fn(paramb.basis_size_angular, rcinv, d12, fc12, fn12);
+        double gn12 = 0.0;
+        for (int k = 0; k <= paramb.basis_size_angular; ++k) {
+          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
+          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
+          gn12 += fn12[k] * annmb.c[c_index];
+        }
+        accumulate_s(paramb.L_max, d12, r12[0], r12[1], r12[2], gn12, s);
+#endif
+      }
+      find_q(
+        paramb.L_max, paramb.num_L, paramb.n_max_angular + 1, n, s, q + (paramb.n_max_radial + 1));
+    }
+
+    // Apply scaling to descriptor
+    for (int d = 0; d < dim; ++d) {
+      q[d] *= paramb.q_scaler[d];
+    }
+
+    // Apply neural network with B_projection enabled
+    double energy = 0.0;
+    for (int d = 0; d < dim; ++d) {
+      Fp[d] = 0.0;
+    }
+
+    apply_ann_one_layer(
+      dim, num_neurons, annmb.w0[t1], annmb.b0[t1], annmb.w1[t1], annmb.b1, q, energy, Fp,
+      latent_space, true, B_projection);
+
+    // Aggregate B_projection into gradient vector
+    // B_projection layout per neuron: [n * (dim + 2) + d] where:
+    //   - d = 0 to dim-1: dE/dw0[n,d]
+    //   - d = dim: dE/db0[n]
+    //   - d = dim+1: dE/dw1[n]
+    for (int l = 0; l < num_neurons; ++l) {
+      const int neuron_offset = l * (dim + 2);
+
+      // A_l = dE/dv_l = sum over atoms of tanh(...)
+      gradient[l] += B_projection[neuron_offset + dim + 1];
+
+      // B_lj = dE/dw_lj = sum over atoms of v_l * D_ij * (1-tanh^2)
+      for (int j = 0; j < dim; ++j) {
+        gradient[num_neurons + l * dim + j] += B_projection[neuron_offset + j];
+      }
+
+      // C_l = dE/db_l = sum over atoms of -v_l * (1-tanh^2)
+      gradient[num_neurons + num_neurons * dim + l] += B_projection[neuron_offset + dim];
+    }
+
+    // dE/db_output = -1 for each atom
+    gradient[total_size - 1] -= 1.0;
   }
 }
 

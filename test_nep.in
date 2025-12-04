@@ -1,0 +1,65 @@
+# Simple LAMMPS test script for NEP potential
+# Usage: lmp -in test_nep.in
+
+units           metal
+boundary        p p p
+atom_style      atomic
+
+# Create a simple FCC structure (adjust for your system)
+lattice         fcc 3.5
+region          box block 0 3 0 3 0 3
+create_box      1 box
+create_atoms    1 box
+mass            1 12.01  # Change to your element mass
+
+# Neighbor list settings
+neighbor        2.0 bin
+neigh_modify    every 10 delay 0 check no
+
+# NEP potential
+pair_style      nep
+pair_coeff      * * nep.txt C  # Change element name to match your potential
+
+# Output settings
+thermo          10
+thermo_style    custom step temp pe ke etotal press vol
+
+# You can also output gradient components to a fix
+# For example, to save the gradient vector every step:
+# fix             gradout all print 1 "$(c_grad[1]) $(c_grad[2]) ..." file gradient.dat screen no
+
+# Compute NEP descriptors and other properties
+compute         nep all nep/atom
+
+# NEW: Compute average descriptor (global vector)
+# This computes the mean descriptor across all atoms
+compute         aveD all nep/descriptor/avg
+
+# Compute per-atom properties
+compute         peratom all pe/atom
+
+# NEW: Compute global gradient vector (A_l, B_lj, C_l, D)
+# This computes gradients w.r.t. all NEP parameters:
+# - A_l = dE/dv_l = sum_i tanh(sum_j w_lj * D_ij - b_l)  [num_neurons components]
+# - B_lj = dE/dw_lj = sum_i v_l * D_ij * (1 - tanh^2(...))  [num_neurons * dim components]
+# - C_l = dE/db_l = sum_i -v_l * (1 - tanh^2(...))  [num_neurons components]
+# - D = dE/db_output = -N_atoms  [1 component]
+# Total size: num_neurons * (2 + dim) + 1
+compute         grad all nep/gradient
+
+# Dump NEP outputs with descriptors
+dump            1 all custom 100 trajectory.dump id type x y z fx fy fz c_nep[1] c_nep[2] c_nep[3]
+dump_modify     1 format float %20.10f
+
+# Run energy minimization
+minimize        1e-4 1e-6 100 1000
+
+# Run short MD
+velocity        all create 300.0 12345
+fix             1 all nvt temp 300.0 300.0 0.1
+timestep        0.001
+
+# Run simulation
+run             1000
+
+print "Test completed successfully!"

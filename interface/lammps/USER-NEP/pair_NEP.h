@@ -31,7 +31,7 @@ namespace LAMMPS_NS
 class PairNEP : public Pair
 {
 public:
-  double cutoff;
+  double cutoff, cutoffsq;
   NEP3 nep_model;
   int *type_map;
   PairNEP(class LAMMPS*);
@@ -45,7 +45,6 @@ public:
 protected:
   bool inited;
   std::string model_filename;
-  double cutoffsq;
   void allocate();
 };
 } // namespace LAMMPS_NS

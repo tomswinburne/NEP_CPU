@@ -150,7 +150,7 @@ void PairNEP::compute(int eflag, int vflag)
   }
 
   nep_model.compute_for_lammps(
-    atom->nlocal, list->inum, list->ilist, list->numneigh, list->firstneigh, atom->type, type_map, 
+    atom->nlocal, list->inum, list->ilist, list->numneigh, list->firstneigh, atom->type, type_map,
     atom->x, total_potential, total_virial, per_atom_potential, atom->f, per_atom_virial);
 
   if (eflag) {
@@ -162,3 +162,8 @@ void PairNEP::compute(int eflag, int vflag)
     }
   }
 }
+
+// Plugin registration for LAMMPS plugin system
+#ifdef LAMMPS_PLUGIN
+extern "C" void lammps_plugin_finalize() {}
+#endif

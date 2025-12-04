@@ -153,6 +153,12 @@ public:
     const std::vector<double>& position,
     std::vector<double>& B_projection);
 
+  void find_gradient_parameters(
+    const std::vector<int>& type,
+    const std::vector<double>& box,
+    const std::vector<double>& position,
+    std::vector<double>& gradient_vector);
+
   void find_dipole(
     const std::vector<int>& type,
     const std::vector<double>& box,
@@ -193,6 +199,18 @@ public:
     int* type_map,     // map from atom type to element
     double** x,        // atom->x
     double** descriptor // output descriptor[nlocal][dim]
+  );
+
+  void compute_gradient_for_lammps(
+    int nlocal,        // atom->nlocal
+    int inum,          // list->inum
+    int* ilist,        // list->ilist
+    int* numneigh,     // list->numneigh
+    int** firstneigh,  // list->firstneigh
+    int* type,         // atom->type
+    int* type_map,     // map from atom type to element
+    double** x,        // atom->x
+    double* gradient   // output gradient vector
   );
 
   int num_atoms = 0;
